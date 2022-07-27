@@ -2,13 +2,19 @@ import subprocess
 import argparse
 import json
 
+from data_dispatcher.api import DataDispatcherClient
+dd_client = DataDispatcherClient(server_url='https://metacat.fnal.gov:9443/dune/dd/data',
+                              auth_server_url='https://metacat.fnal.gov:8143/auth/dune')
+from metacat.webapi import MetaCatClient
+mc_client = MetaCatClient()
+
 class DDLArInterface:
   def __init__(self, dataset, limit, namespace, lar_limit):
     self.dataset = dataset
     self.limit = limit
     self.namespace = namespace
     query_args = (self.dataset, self.namespace, self.limit)
-    self.query = '''files from %s where 'namespace="%s"' limit %i'''%query_args
+    self.query = '''files from %s where namespace="%s" limit %i'''%query_args
     self.lar_limit = lar_limit
     self.proj_id = -1
     self.proj_exists = False
@@ -20,69 +26,70 @@ class DDLArInterface:
     self.hit_timeout = False
     self.lar_return = -1
     self.lar_file_list = ''
+    self.next_failed = False
+    self.next_replicas = []
+    self.next_name = ''
+
   def SetLarLimit(self, limit):
     self.lar_limit = limit
   def CreateProject(self):
-    proc = subprocess.run('dd project create %s'%self.query,
-                          shell=True, capture_output=True)
-    self.proj_returncode = proc.returncode
-    self.proj_id = proc.stdout.decode('utf-8').strip('\n')
-    if self.proj_returncode == 0:
-      self.proj_state = 'active'
+    query_files = mc_client.query(self.query)
+    proj_dict = dd_client.create_project(query_files, query=self.query)
+    self.proj_state = proj_dict['state']
+    self.proj_id = proj_dict['project_id']
+    self.proj_exists = True
+    print(proj_dict)
+
   def Next(self):
     if self.proj_id < 0:
       raise ValueError('DDLArInterface::Next -- Project ID is %i. Has a project been created?'%self.proj_id)
+    ## exists, state, etc. -- TODO
+    self.next_output = dd_client.next_file(self.proj_id)['handle']
 
-    proc = subprocess.run('dd worker next -j -t %i %i'%(self.timeout, self.proj_id), shell=True, capture_output=True)
-    self.next_output = proc.stdout.decode('utf-8')
-    if self.next_output == 'timeout':
-      self.hit_timeout = True
-      return
-    elif self.next_output == 'done':
-      self.project_done = True
+    if self.next_output == None:
+      self.next_failed = True
       return
 
-    self.next_json = json.loads(proc.stdout.decode('utf-8'))
-    self.next_name = self.next_json['name']
-    self.next_replicas = self.next_json['replicas']
-    print(proc.stdout)
+    self.next_name = self.next_output['name']
+    self.next_replicas = list(self.next_output['replicas'].values())
+
   def PrintFiles(self):
     print('Printing files')
     for j in self.loaded_files:
       print(j['name'])
   def LoadFiles(self):
     count = 0
-    while (count < self.lar_limit and not self.hit_timeout and
+    while (count < self.lar_limit and not self.next_failed and
            self.proj_state == 'active'):
+      print('Attempting fetch %i/%i'%(count, self.lar_limit), self.next_failed)
       self.Next()
-      if len(self.next_replicas) > 0:
-        self.loaded_files.append(self.next_json)
+      if self.next_output == None:
+        continue
+      elif len(self.next_replicas) > 0:
+        self.loaded_files.append(self.next_output)
         count += 1
       else:
         print('Empty replicas -- marking as failed')
-        proc = subprocess.run('dd worker failed -f %i %s:%s'%(self.proj_id, self.next_json['namespace'], self.next_json['name']),
-                              shell=True, capture_output=True)
+        dd_client.file_failed(self.proj_id, '%s:%s'%(self.next_output['namespace'], self.next_output['name']))
         ##Mark that file as failed -- TODO
     self.loaded = True
   def MarkFiles(self, failed=False):
     state = 'failed' if failed else 'done'
     for j in self.loaded_files:
-      proc = subprocess.run('dd worker %s %i %s:%s'%(state, self.proj_id, j['namespace'], j['name']),
-                            shell=True, capture_output=True)
-      if proc.returncode == 0:
-        print('Successfully marked %s as %s'%(j['name'], state))
+      if failed:
+        dd_client.file_failed(self.proj_id, '%s:%s'%(j['namespace'], j['name']))
       else:
-        print('Error %s'%j['name'])
+        dd_client.file_done(self.proj_id, '%s:%s'%(j['namespace'], j['name']))
 
   def AttachProject(self, proj_id):
     self.proj_id = proj_id
-    proc = subprocess.run('dd project show -j %i'%self.proj_id, shell=True,
-                          capture_output=True)
-
-    if proc.stdout.decode('utf-8') == 'null': self.proj_exists = False
+    proj = dd_client.get_project(proj_id)
+    if proj == None:
+      self.proj_exists = False
     else:
       self.proj_exists = True
-      self.proj_state = json.loads(proc.stdout.decode('utf-8'))['state']
+      self.proj_state = proj['state']
+
   def RunLar(self, fcl, nevents, output=None):
     cmd = 'lar -c %s -s %s -n %i'%(fcl, self.lar_file_list, nevents)
     if output: cmd += ' -o %s'%output
@@ -93,17 +100,19 @@ class DDLArInterface:
 
   def BuildFileListString(self):
     for j in self.loaded_files:
-      if len(j['replicas']) > 0:
+      replicas = list(j['replicas'].values())
+      if len(replicas) > 0:
         #Get the first replica
-        replica = j['replicas'][0]
+        replica = replicas[0]
         uri = replica['url']
         if 'https://eospublic.cern.ch/e' in uri: uri = uri.replace('https://eospublic.cern.ch/e', 'xroot://eospublic.cern.ch//e')
         self.lar_file_list += uri
         self.lar_file_list += ' '
       else:
         print('Empty replicas -- marking as failed')
-        proc = subprocess.run('dd worker failed -f %i %s:%s'%(self.proj_id, self.next_json['namespace'], self.next_json['name']),
-                              shell=True, capture_output=True)
+        
+        ##TODO -- pop entry
+        dd_client.file_failed(self.proj_id, '%s:%s'%(j['namespace'], j['name']))
 if __name__ == '__main__':
   parser = argparse.ArgumentParser(description = 'Wrapper around lar')
   
